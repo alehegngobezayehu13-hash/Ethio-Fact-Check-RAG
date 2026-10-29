@@ -1,0 +1,140 @@
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
+from google.genai import errors as genai_errors
+from pydantic import BaseModel, Field
+from typing import Optional
+
+from backend.app.documents import load_all_documents
+from backend.app.retriever import Retriever
+from backend.app.verdict import check_claim
+
+TOP_K = 3
+FRONTEND_DIR = Path(__file__).resolve().parents[2] / "frontend"
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Build the search index once at startup, not on every request.
+    app.state.retriever = Retriever(load_all_documents())
+    yield
+
+
+app = FastAPI(
+    title="Ethio Fake News Detector",
+    description="RAG-based fake news checker for Amharic, English, Tigrinya and Afaan Oromo.",
+    version="0.1.0",
+    lifespan=lifespan,
+)
+
+
+class CheckRequest(BaseModel):
+    claim: str = Field(max_length=1000)
+
+
+class EvidenceItem(BaseModel):
+    id: str
+    language: str
+    text: str
+    source: str
+    url: str
+    title: str
+    score: float
+
+
+class CheckResponse(BaseModel):
+    claim: str
+    verdict: Optional[str]
+    explanation: str
+    evidence_ids: list[str]
+    evidence: list[EvidenceItem]
+
+
+@app.get("/health")
+def health():
+    """Simple endpoint to confirm the server is running."""
+    return {"status": "ok"}
+
+
+@app.post("/check", response_model=CheckResponse)
+def check(body: CheckRequest, request: Request):
+    """Check a claim: retrieve evidence, then ask the LLM for a verdict."""
+    claim = body.claim.strip()
+    if len(claim) < 3:
+        raise HTTPException(status_code=400, detail="Claim is too short.")
+
+    start_time = time.perf_counter()
+
+    results = request.app.state.retriever.search(
+        claim,
+        k=TOP_K,
+    )
+
+    retrieval_time = time.perf_counter() - start_time
+
+    evidence_docs = [
+        doc for doc, _ in results
+    ]
+
+    gemini_start = time.perf_counter()
+
+    gemini_start = time.perf_counter()
+
+    try:
+        verdict = check_claim(
+            claim,
+            evidence_docs,
+        )
+
+    except genai_errors.APIError as e:
+        print(
+            f"Gemini API error: {type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gemini API error: {e}",
+        ) from e
+
+    except Exception as e:
+        print(
+            f"Unexpected verdict error: {type(e).__name__}: {e}",
+            flush=True,
+        )
+        raise
+
+    finally:
+        gemini_time = time.perf_counter() - gemini_start
+
+        print(
+            f"Retrieval: {retrieval_time:.2f}s | "
+            f"Gemini: {gemini_time:.2f}s | "
+            f"Total: {time.perf_counter() - start_time:.2f}s",
+            flush=True,
+        )
+    return CheckResponse(
+        claim=claim,
+        verdict=verdict["verdict"],
+        explanation=verdict["explanation"],
+        evidence_ids=verdict["evidence_ids"],
+        evidence=[
+            EvidenceItem(
+                id=doc.id,
+                language=doc.language,
+                text=doc.text,
+                source=doc.source,
+                url=doc.url,
+                title=doc.title,
+                score=score,
+            )
+            for doc, score in results
+        ],
+    )
+
+
+# Must come last so it doesn't shadow the API routes above.
+app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
